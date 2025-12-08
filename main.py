@@ -1,141 +1,7 @@
 import torch
 import torch.nn as nn
 
-
-def comp_grid(y, num_grid):
-    """
-    Compute grid indices and interpolation weights for treatment values
-
-    Args:
-        y: Treatment values in [0,1], shape (batch_size,)
-        num_grid: Number of grid intervals (B)
-
-    Returns:
-        L: Lower grid indices
-        U: Upper grid indices
-        inter: Interpolation weights (distance from lower to upper)
-    """
-    # L gives the lower index
-    # U gives the upper index
-    # inter gives the distance to the lower int
-    U = torch.ceil(y * num_grid)
-    inter = 1 - (U - y * num_grid)
-    L = U - 1
-    L += (L < 0).int()
-    return L.int().tolist(), U.int().tolist(), inter
-
-
-class Density_Block(nn.Module):
-    """
-    Grid-based density estimation block
-
-    Assumes the treatment variable is bounded by [0,1]
-    Output grid: 0, 1/B, 2/B, ..., B/B; output dim = B + 1; num_grid = B
-    """
-
-    def __init__(self, num_grid, ind, isbias=1):
-        super(Density_Block, self).__init__()
-        self.ind = ind  # Input dimension
-        self.num_grid = num_grid  # Number of grid intervals
-        self.outd = num_grid + 1  # Number of grid points
-        self.isbias = isbias
-
-        # Learnable parameters
-        self.weight = nn.Parameter(torch.rand(self.ind, self.outd), requires_grad=True)
-        if self.isbias:
-            self.bias = nn.Parameter(torch.rand(self.outd), requires_grad=True)
-        else:
-            self.bias = None
-
-        self.softmax = nn.Softmax(dim=1)
-
-    def forward(self, t, x):
-        """
-        Forward pass
-
-        Args:
-            t: Treatment values, shape (batch_size,) - assumed in [0,1]
-            x: Representation input, shape (batch_size, ind)
-
-        Returns:
-            Interpolated density values at treatment positions
-        """
-        # Linear transformation to get logits for each grid point
-        out = torch.matmul(x, self.weight)
-        if self.isbias:
-            out += self.bias
-
-        # Softmax to get probability distribution over grid
-        out = self.softmax(out)
-
-        # Get interpolated density at actual treatment values
-        x1 = list(torch.arange(0, x.shape[0]))
-        L, U, inter = comp_grid(t, self.num_grid)
-        L_out = out[x1, L]
-        U_out = out[x1, U]
-
-        # Linear interpolation between grid points
-        out = L_out + (U_out - L_out) * inter
-        return out
-
-
-class Truncated_power:
-    """
-    Truncated power basis functions for spline approximation.
-    Data is assumed to be in [0,1].
-
-    Creates basis functions:
-    - Polynomial terms: 1, t, t², ..., t^degree
-    - Truncated terms: (t - knot_i)_+^degree for each knot
-    where (·)_+ = max(0, ·)
-    """
-
-    def __init__(self, degree, knots):
-        """
-        Args:
-            degree: int, degree of truncated power basis
-            knots: list, knots for spline basis (should not include 0 and 1)
-        """
-        self.degree = degree
-        self.knots = knots
-        self.num_of_basis = self.degree + 1 + len(self.knots)
-        self.relu = nn.ReLU(inplace=True)
-
-        if self.degree == 0:
-            print("Degree should not be set to 0!")
-            raise ValueError
-        if not isinstance(self.degree, int):
-            print("Degree should be int")
-            raise ValueError
-
-    def forward(self, x):
-        """
-        Args:
-            x: torch.tensor, shape (batch_size, 1) or (batch_size,)
-
-        Returns:
-            Basis function values, shape (batch_size, num_of_basis)
-        """
-        x = x.squeeze()
-        out = torch.zeros(x.shape[0], self.num_of_basis)
-
-        for i in range(self.num_of_basis):
-            if i <= self.degree:
-                # Polynomial terms
-                if i == 0:
-                    out[:, i] = 1.0
-                else:
-                    out[:, i] = x**i
-            else:
-                # Truncated power terms
-                if self.degree == 1:
-                    out[:, i] = self.relu(x - self.knots[i - self.degree])
-                else:
-                    out[:, i] = (
-                        self.relu(x - self.knots[i - self.degree - 1])
-                    ) ** self.degree
-
-        return out  # (batch_size, num_of_basis)
+from src.helper import Density_Block, Truncated_power, MLP, comp_grid
 
 
 class Dynamic_FC(nn.Module):
@@ -222,27 +88,10 @@ class Dynamic_FC(nn.Module):
 
         return out
 
-    """Multi-layer perceptron with ReLU activations"""
-
-    def __init__(self, input_dim, hidden_dims):
-        super(MLP, self).__init__()
-        layers = []
-        prev_dim = input_dim
-
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            prev_dim = hidden_dim
-
-        self.network = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.network(x)
-
 
 class DTRnet(nn.Module):
     """
-    Dynamic Treatment Regime Network (DTRnet)
+    Disentangled Representation Network (DTRnet)
 
     DTRnet learns disentangled representations to precisely control selection bias
     for estimating individual treatment effects with continuous treatments.
@@ -303,9 +152,9 @@ class DTRnet(nn.Module):
         self.outcome_hidden_dims = outcome_hidden_dims
 
         # Three embedding networks (disentangled representations)
-        self.hidden_features_gamma = MLP(input_dim, [hidden_dim, hidden_dim])  # φ_γ
-        self.hidden_features_delta = MLP(input_dim, [hidden_dim, hidden_dim])  # φ_δ
-        self.hidden_features_psi = MLP(input_dim, [hidden_dim, hidden_dim])  # φ_ψ
+        self.hidden_features_gamma = MLP([input_dim, hidden_dim, hidden_dim])  # φ_γ
+        self.hidden_features_delta = MLP([input_dim, hidden_dim, hidden_dim])  # φ_δ
+        self.hidden_features_psi = MLP([input_dim, hidden_dim, hidden_dim])  # φ_ψ
 
         # Balancing density estimator: p(t | φ_γ, φ_δ)
         # Input: concatenation of gamma and delta representations
@@ -402,47 +251,54 @@ if __name__ == "__main__":
     # Example configuration
     input_dim = 10
     hidden_dim = 200
-    num_grid = 10
+    num_grid = 100
     degree = 2
     knots = [0.33, 0.67]
     outcome_hidden_dims = [200, 200]
-    batch_size = 32
+    batch_size = 10
 
-    model = DTRnet(
-        input_dim=input_dim,
-        hidden_dim=hidden_dim,
-        num_grid=num_grid,
-        degree=degree,
-        knots=knots,
-        outcome_hidden_dims=outcome_hidden_dims,
-    )
-
-    # Create dummy data
+    # # Create dummy data
     x = torch.randn(batch_size, input_dim)
     t = torch.rand(batch_size)  # Continuous treatment in [0,1]
 
-    # Forward pass
-    g, Q, gamma, delta, psi, g_psi = model(t, x)
-
-    print("=" * 60)
-    print("DTRnet - Complete Architecture")
-    print("=" * 60)
-    print(f"\nInput:")
     print(f"  Covariates (X) shape: {x.shape}")
     print(f"  Treatment (t) shape: {t.shape}")
+    print(f"The treatment t {t}")
+    L, U, inter = comp_grid(t, num_grid)
 
-    print(f"\nRepresentations:")
-    print(f"  Gamma (φ_γ) shape: {gamma.shape}")
-    print(f"  Delta (φ_δ) shape: {delta.shape}")
-    print(f"  Psi (φ_ψ) shape: {psi.shape}")
+    print(L)
+    print(U)
+    print(inter)
 
-    print(f"\nDensity Estimates:")
-    print(f"  Balancing density (g) shape: {g.shape}")
-    print(f"  Balancing density values (sample): {g[:5]}")
-    print(f"  Outcome density (g_psi) shape: {g_psi.shape}")
-    print(f"  Outcome density values (sample): {g_psi[:5]}")
+    # model = DTRnet(
+    #     input_dim=input_dim,
+    #     hidden_dim=hidden_dim,
+    #     num_grid=num_grid,
+    #     degree=degree,
+    #     knots=knots,
+    #     outcome_hidden_dims=outcome_hidden_dims,
+    # )
 
-    print(f"\nOutcome Prediction:")
-    print(f"  Predicted outcome (Q) shape: {Q.shape}")
-    print(f"  Predicted outcome values (sample): {Q[:5]}")
-    print("=" * 60)
+    # # Forward pass
+    # g, Q, gamma, delta, psi, g_psi = model(t, x)
+
+    # print("=" * 60)
+    # print("DTRnet - Complete Architecture")
+    # print("=" * 60)
+    # print(f"\nInput:")
+
+    # print(f"\nRepresentations:")
+    # print(f"  Gamma (φ_γ) shape: {gamma.shape}")
+    # print(f"  Delta (φ_δ) shape: {delta.shape}")
+    # print(f"  Psi (φ_ψ) shape: {psi.shape}")
+
+    # print(f"\nDensity Estimates:")
+    # print(f"  Balancing density (g) shape: {g.shape}")
+    # print(f"  Balancing density values (sample): {g[:5]}")
+    # print(f"  Outcome density (g_psi) shape: {g_psi.shape}")
+    # print(f"  Outcome density values (sample): {g_psi[:5]}")
+
+    # print(f"\nOutcome Prediction:")
+    # print(f"  Predicted outcome (Q) shape: {Q.shape}")
+    # print(f"  Predicted outcome values (sample): {Q[:5]}")
+    # print("=" * 60)
